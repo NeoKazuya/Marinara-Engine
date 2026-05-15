@@ -35,9 +35,9 @@ export class AnthropicProvider extends BaseLLMProvider {
 
     const url = `${this.baseUrl}/messages`;
 
-    // Claude requires system prompt separate from messages — filter out empty-content messages
+    // Claude requires system prompt separate from messages — keep image-only non-system messages.
     const systemMessages = messages.filter((m) => m.role === "system" && m.content?.trim());
-    const chatMessages = messages.filter((m) => m.role !== "system" && m.content?.trim());
+    const chatMessages = messages.filter((m) => m.role !== "system" && (m.content?.trim() || m.images?.length));
 
     // Ensure alternating user/assistant pattern (Claude requirement)
     const mergedMessages = this.mergeConsecutiveMessages(chatMessages);

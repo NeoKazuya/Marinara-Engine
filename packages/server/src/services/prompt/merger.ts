@@ -3,13 +3,19 @@
 // ──────────────────────────────────────────────
 import type { ChatMLMessage } from "@marinara-engine/shared";
 
+export function hasPromptMessagePayload(msg: ChatMLMessage): boolean {
+  if (msg.content.trim()) return true;
+  if (msg.images?.length) return true;
+  return Boolean(msg.providerMetadata && Object.keys(msg.providerMetadata).length > 0);
+}
+
 /**
  * Merge consecutive messages that share the same role, with a double-newline separator.
  *
  * Rules:
  * - Only merges when adjacent messages have the **exact same** role.
  * - Preserves the `name` of the first message if set.
- * - Skips empty messages entirely.
+ * - Skips messages only when they have no text or provider payload.
  *
  * @example
  *   [{ role: "system", content: "A" }, { role: "system", content: "B" }, { role: "user", content: "C" }]
@@ -32,9 +38,15 @@ export function mergeAdjacentMessages(messages: ChatMLMessage[]): ChatMLMessage[
     return a.contextKind === b.contextKind;
   };
 
+  const mergeContent = (a: string, b: string) => {
+    if (!a.trim()) return b;
+    if (!b.trim()) return a;
+    return `${a}\n\n${b}`;
+  };
+
   for (const msg of messages) {
-    // Skip empty messages
-    if (!msg.content.trim()) continue;
+    // Skip only messages that cannot affect the provider prompt.
+    if (!hasPromptMessagePayload(msg)) continue;
 
     if (current && canMerge(current, msg)) {
       // Same role — merge
@@ -45,7 +57,7 @@ export function mergeAdjacentMessages(messages: ChatMLMessage[]): ChatMLMessage[
       const mergedContextKind = mergeContextKind(current.contextKind, msg.contextKind);
       current = {
         role: current.role,
-        content: current.content + "\n\n" + msg.content,
+        content: mergeContent(current.content, msg.content),
         ...(mergedContextKind ? { contextKind: mergedContextKind } : {}),
         name: current.name,
         ...(mergedImages ? { images: mergedImages } : {}),

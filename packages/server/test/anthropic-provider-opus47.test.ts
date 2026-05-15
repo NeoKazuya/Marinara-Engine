@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { zstdCompressSync } from "node:zlib";
 import { AnthropicProvider } from "../src/services/llm/providers/anthropic.provider.js";
-import type { ChatOptions } from "../src/services/llm/base-provider.js";
+import type { ChatMessage, ChatOptions } from "../src/services/llm/base-provider.js";
 
 async function captureRequestBody(
   overrides: Partial<ChatOptions> = {},
-  messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [{ role: "user", content: "Hello" }],
+  messages: ChatMessage[] = [{ role: "user", content: "Hello" }],
 ) {
   const requests: Array<Record<string, unknown>> = [];
   const originalFetch = globalThis.fetch;
@@ -97,6 +97,23 @@ test("Anthropic prompt caching uses configured conversation depth", async () => 
   const messages = body.messages as Array<{ role: string; content: unknown }>;
   assert.deepEqual(messages[2]?.content, [{ type: "text", text: "u2", cache_control: { type: "ephemeral" } }]);
   assert.equal(messages[4]?.content, "u3");
+});
+
+test("Anthropic chat keeps image-only user messages", async () => {
+  const image = "data:image/png;base64,abc123";
+  const body = await captureRequestBody(
+    { enableThinking: false, model: "claude-sonnet-4-5" },
+    [{ role: "user", content: "", images: [image] }],
+  );
+
+  const messages = body.messages as Array<{ role: string; content: unknown }>;
+  assert.deepEqual(messages, [
+    {
+      role: "user",
+      content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "abc123" } }],
+    },
+  ]);
+  assert.equal(JSON.stringify(body).includes("Continue."), false);
 });
 
 test("Anthropic non-stream chat decodes raw zstd JSON without content-encoding", async () => {

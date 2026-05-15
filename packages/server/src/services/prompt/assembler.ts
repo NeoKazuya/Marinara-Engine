@@ -19,7 +19,7 @@ import { resolveMacros } from "@marinara-engine/shared";
 import type { MacroContext } from "@marinara-engine/shared";
 import { wrapContent, wrapGroup } from "./format-engine.js";
 import { expandMarker, type MarkerContext } from "./marker-expander.js";
-import { mergeAdjacentMessages, squashLeadingSystemMessages } from "./merger.js";
+import { hasPromptMessagePayload, mergeAdjacentMessages, squashLeadingSystemMessages } from "./merger.js";
 import { injectAtDepth } from "../lorebook/prompt-injector.js";
 import {
   buildPromptMacroContext,
@@ -427,8 +427,8 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     finalMessages = [{ role: "user", content: combined }];
   }
 
-  // ── Final: Drop any messages with empty/whitespace-only content ──
-  finalMessages = finalMessages.filter((m) => m.content?.trim());
+  // ── Final: Drop only messages that cannot affect the provider prompt ──
+  finalMessages = finalMessages.filter(hasPromptMessagePayload);
 
   return {
     messages: finalMessages,

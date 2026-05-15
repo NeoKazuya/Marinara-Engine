@@ -801,6 +801,22 @@ test("responses requests include fallback input for system-only prompts", () => 
   assert.deepEqual(body.input, [{ role: "user", content: "Continue." }]);
 });
 
+test("OpenAI-compatible chat completions keep image-only user messages", async () => {
+  const image = "data:image/png;base64,abc123";
+  const body = await captureChatRequestBodyForMessages(
+    [{ role: "user", content: "", images: [image] }],
+    "test-model",
+    { reasoningEffort: null },
+  );
+
+  assert.deepEqual(body.messages, [
+    {
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: image } }],
+    },
+  ]);
+});
+
 test("OpenAI ChatGPT responses requests omit unsupported Codex parameters", () => {
   const provider = new OpenAIProvider(
     "https://chatgpt.com/backend-api/codex",

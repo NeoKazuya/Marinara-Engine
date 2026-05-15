@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DEFAULT_GENERATION_PARAMS } from "@marinara-engine/shared";
+import type { DB } from "../src/db/connection.js";
+import { assemblePrompt } from "../src/services/prompt/assembler.js";
 import { mergeAdjacentMessages } from "../src/services/prompt/merger.js";
 
 test("provider normalization keeps post-history prompt instructions separate from the last user turn", () => {
@@ -41,5 +44,80 @@ test("provider normalization still merges adjacent messages from the same contex
       },
       { role: "user", contextKind: "history", content: "Earlier user turn\n\nAnother user fragment" },
     ],
+  );
+});
+
+test("provider normalization keeps image-only user messages", () => {
+  const image = "data:image/png;base64,abc123";
+  const merged = mergeAdjacentMessages([
+    { role: "user", content: "   " },
+    { role: "user", content: "", images: [image] },
+  ]);
+
+  assert.deepEqual(merged, [{ role: "user", content: "", images: [image] }]);
+});
+
+test("provider normalization merges image-only fragments without blank separators", () => {
+  const image = "data:image/png;base64,abc123";
+  const merged = mergeAdjacentMessages([
+    { role: "user", content: "", images: [image] },
+    { role: "user", content: "Describe this image." },
+  ]);
+
+  assert.deepEqual(
+    merged.map((message) => ({ role: message.role, content: message.content, images: message.images })),
+    [{ role: "user", content: "Describe this image.", images: [image] }],
+  );
+});
+
+test("prompt assembly keeps image-only chat history messages", async () => {
+  const image = "data:image/png;base64,abc123";
+  const result = await assemblePrompt({
+    db: {} as DB,
+    preset: {
+      id: "preset-1",
+      name: "Preset",
+      sectionOrder: JSON.stringify(["history-section"]),
+      groupOrder: "[]",
+      wrapFormat: "none",
+      parameters: JSON.stringify(DEFAULT_GENERATION_PARAMS),
+      variableGroups: "[]",
+      variableValues: "{}",
+    },
+    sections: [
+      {
+        id: "history-section",
+        presetId: "preset-1",
+        identifier: "history",
+        name: "History",
+        content: "",
+        role: "user",
+        enabled: "true",
+        isMarker: "true",
+        groupId: null,
+        markerConfig: JSON.stringify({ type: "chat_history" }),
+        injectionPosition: "ordered",
+        injectionDepth: 0,
+        injectionOrder: 0,
+        forbidOverrides: "false",
+      },
+    ],
+    groups: [],
+    choiceBlocks: [],
+    chatChoices: {},
+    chatId: "chat-1",
+    characterIds: [],
+    personaName: "User",
+    personaDescription: "",
+    chatMessages: [
+      { role: "user", content: "", images: [image] },
+      { role: "user", content: "Describe this image." },
+    ],
+    activeLorebookIds: [],
+  });
+
+  assert.deepEqual(
+    result.messages.map((message) => ({ role: message.role, content: message.content, images: message.images })),
+    [{ role: "user", content: "Describe this image.", images: [image] }],
   );
 });

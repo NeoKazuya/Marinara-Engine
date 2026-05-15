@@ -67,9 +67,9 @@ export class GoogleProvider extends BaseLLMProvider {
     const endpoint = useStreaming ? "streamGenerateContent" : "generateContent";
     const url = `${base}/models/${model}:${endpoint}${useStreaming ? "?alt=sse" : ""}`;
 
-    // Convert to Gemini format — filter out empty-content messages
+    // Convert to Gemini format — keep image-only non-system messages.
     const systemMessages = messages.filter((m) => m.role === "system" && m.content?.trim());
-    const chatMessages = messages.filter((m) => m.role !== "system" && m.content?.trim());
+    const chatMessages = messages.filter((m) => m.role !== "system" && (m.content?.trim() || m.images?.length));
 
     const contents = chatMessages.map((m) => {
       // If this model message has stored Gemini parts (with thought signatures),
@@ -88,7 +88,7 @@ export class GoogleProvider extends BaseLLMProvider {
           }
         }
       }
-      parts.push({ text: m.content });
+      if (m.content) parts.push({ text: m.content });
       return {
         role: m.role === "assistant" ? ("model" as const) : ("user" as const),
         parts,

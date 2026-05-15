@@ -603,7 +603,8 @@ export class OpenAIProvider extends BaseLLMProvider {
         // Keep tool messages and assistant messages with tool_calls regardless of content
         if (m.role === "tool") return true;
         if (m.role === "assistant" && m.tool_calls?.length) return true;
-        // Drop messages with empty/whitespace-only content
+        if (m.images?.length) return true;
+        // Drop messages with no provider-visible payload.
         return m.content?.trim();
       })
       .map((m) => {

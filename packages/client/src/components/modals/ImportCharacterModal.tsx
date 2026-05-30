@@ -5,7 +5,7 @@ import { useState, useRef } from "react";
 import { Modal } from "../ui/Modal";
 import { Download, FileJson, Image, CheckCircle, XCircle, Loader2, BookOpen } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { characterKeys } from "../../hooks/use-characters";
+import { characterKeys, useCharacters } from "../../hooks/use-characters";
 import { lorebookKeys } from "../../hooks/use-lorebooks";
 import { api } from "../../lib/api-client";
 import {
@@ -25,6 +25,12 @@ type ImportResultRow = {
 };
 
 type TagImportMode = "all" | "none" | "existing";
+type ImportMode = "new" | "update";
+type CharacterRow = Record<string, unknown> & {
+  id?: string;
+  name?: string;
+  data?: unknown;
+};
 
 const TAG_IMPORT_OPTIONS: Array<{ value: TagImportMode; label: string; description: string }> = [
   { value: "all", label: "All tags", description: "Keep source tags." },
@@ -32,8 +38,30 @@ const TAG_IMPORT_OPTIONS: Array<{ value: TagImportMode; label: string; descripti
   { value: "existing", label: "Existing only", description: "Keep tags already in Marinara." },
 ];
 
+function readRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function readString(value: unknown, fallback = "") {
+  return typeof value === "string" ? value : fallback;
+}
+
+function characterDisplayName(character: CharacterRow | undefined) {
+  const data = readRecord(character?.data);
+  return readString(character?.name) || readString(data.name) || "Unnamed character";
+}
+
 export function ImportCharacterModal({ open, onClose }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const { data: rawCharacters } = useCharacters(open);
   const [status, setStatus] = useState<"idle" | "loading" | "done">("idle");
   const [results, setResults] = useState<ImportResultRow[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -42,7 +70,20 @@ export function ImportCharacterModal({ open, onClose }: Props) {
     previews: EmbeddedLorebookImportPreview[];
   } | null>(null);
   const [tagImportMode, setTagImportMode] = useState<TagImportMode>("all");
+  const [importMode, setImportMode] = useState<ImportMode>("new");
+  const [targetCharacterId, setTargetCharacterId] = useState("");
   const qc = useQueryClient();
+  const characters = (Array.isArray(rawCharacters) ? rawCharacters : []) as CharacterRow[];
+  const targetCharacterName = characterDisplayName(characters.find((character) => character.id === targetCharacterId));
+  const acceptsMultipleFiles = importMode === "new";
+
+  const setMode = (mode: ImportMode) => {
+    setImportMode(mode);
+    setPendingLorebookChoice(null);
+    setResults([]);
+    setStatus("idle");
+    if (mode === "new") setTargetCharacterId("");
+  };
 
   const isZipFile = async (file: File): Promise<boolean> => {
     if (file.size < 4) return false;
@@ -52,6 +93,28 @@ export function ImportCharacterModal({ open, onClose }: Props) {
 
   const handleFiles = async (files: File[], importEmbeddedLorebook?: boolean) => {
     if (files.length === 0) return;
+    if (importMode === "update" && !targetCharacterId) {
+      setResults([
+        {
+          filename: files.length === 1 ? files[0]!.name : `${files.length} files`,
+          success: false,
+          message: "Choose a character to update first.",
+        },
+      ]);
+      setStatus("done");
+      return;
+    }
+    if (importMode === "update" && files.length !== 1) {
+      setResults([
+        {
+          filename: `${files.length} files`,
+          success: false,
+          message: "Update existing accepts one character file at a time.",
+        },
+      ]);
+      setStatus("done");
+      return;
+    }
     setStatus("loading");
     setResults([]);
     setPendingLorebookChoice(null);
@@ -81,13 +144,24 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           json.version === 1 && typeof json.type === "string" && (json.type as string).startsWith("marinara_");
 
         if (isMarinaraEnvelope) {
+          if (importMode === "update" && json.type !== "marinara_character") {
+            setResults([
+              {
+                filename: file.name,
+                success: false,
+                message: "Update existing only supports character exports.",
+              },
+            ]);
+            setStatus("done");
+            return;
+          }
           marinaraPayloads.push({ file, payload: json });
         } else {
           stCharacterFiles.push(file);
         }
       }
 
-      if (stCharacterFiles.length > 0 && importEmbeddedLorebook === undefined) {
+      if (importMode === "new" && stCharacterFiles.length > 0 && importEmbeddedLorebook === undefined) {
         const previews = await inspectCharacterFilesForEmbeddedLorebooks(stCharacterFiles);
         if (previews.length > 0) {
           setPendingLorebookChoice({ files, previews });
@@ -113,8 +187,14 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             })),
           ),
         );
-        form.append("importEmbeddedLorebook", String(importEmbeddedLorebook ?? true));
+        form.append(
+          "importEmbeddedLorebook",
+          String(importMode === "update" ? false : (importEmbeddedLorebook ?? true)),
+        );
         form.append("tagImportMode", tagImportMode);
+        if (importMode === "update") {
+          form.append("targetCharacterId", targetCharacterId);
+        }
 
         const batchResult = await api.upload<{
           success: boolean;
@@ -133,15 +213,18 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           nextResults.push({
             filename: result.filename,
             success: result.success,
-            message: result.success
-              ? `Imported "${result.name ?? result.filename}"${
-                  result.embeddedLorebook?.skipped
-                    ? " without creating the embedded lorebook"
-                    : result.lorebook?.lorebookId
-                      ? " with its embedded lorebook"
-                      : ""
-                }`
-              : (result.error ?? "Import failed"),
+            message:
+              result.success && importMode === "update"
+                ? `Updated "${targetCharacterName}" from "${result.name ?? result.filename}"`
+                : result.success
+                  ? `Imported "${result.name ?? result.filename}"${
+                      result.embeddedLorebook?.skipped
+                        ? " without creating the embedded lorebook"
+                        : result.lorebook?.lorebookId
+                          ? " with its embedded lorebook"
+                          : ""
+                    }`
+                  : (result.error ?? "Import failed"),
           });
         }
       }
@@ -154,6 +237,7 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             error?: string;
           }>("/import/marinara", {
             ...item.payload,
+            ...(importMode === "update" ? { targetCharacterId } : {}),
             timestampOverrides: {
               createdAt: item.file.lastModified,
               updatedAt: item.file.lastModified,
@@ -163,7 +247,12 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           nextResults.push({
             filename: item.file.name,
             success: result.success,
-            message: result.success ? `Imported "${result.name ?? item.file.name}"` : (result.error ?? "Import failed"),
+            message:
+              result.success && importMode === "update"
+                ? `Updated "${targetCharacterName}" from "${result.name ?? item.file.name}"`
+                : result.success
+                  ? `Imported "${result.name ?? item.file.name}"`
+                  : (result.error ?? "Import failed"),
           });
         } catch (error) {
           nextResults.push({
@@ -182,6 +271,9 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             "timestampOverrides",
             JSON.stringify({ createdAt: file.lastModified, updatedAt: file.lastModified }),
           );
+          if (importMode === "update") {
+            form.append("targetCharacterId", targetCharacterId);
+          }
           const result = await api.upload<{ success: boolean; name?: string; error?: string }>(
             "/import/marinara-package",
             form,
@@ -189,7 +281,12 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           nextResults.push({
             filename: file.name,
             success: result.success,
-            message: result.success ? `Imported "${result.name ?? file.name}"` : (result.error ?? "Import failed"),
+            message:
+              result.success && importMode === "update"
+                ? `Updated "${targetCharacterName}" from "${result.name ?? file.name}"`
+                : result.success
+                  ? `Imported "${result.name ?? file.name}"`
+                  : (result.error ?? "Import failed"),
           });
         } catch (error) {
           nextResults.push({
@@ -205,6 +302,10 @@ export function ImportCharacterModal({ open, onClose }: Props) {
 
       if (nextResults.some((result) => result.success)) {
         qc.invalidateQueries({ queryKey: characterKeys.list() });
+        if (importMode === "update") {
+          qc.invalidateQueries({ queryKey: characterKeys.detail(targetCharacterId) });
+          qc.invalidateQueries({ queryKey: characterKeys.versions(targetCharacterId) });
+        }
       }
       if (importedLorebook) {
         qc.invalidateQueries({ queryKey: lorebookKeys.all });
@@ -232,6 +333,8 @@ export function ImportCharacterModal({ open, onClose }: Props) {
     setResults([]);
     setPendingLorebookChoice(null);
     setTagImportMode("all");
+    setImportMode("new");
+    setTargetCharacterId("");
   };
 
   return (
@@ -287,6 +390,75 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             </div>
           </div>
         )}
+
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--secondary)]/40 p-3">
+          <div className="mb-2">
+            <p className="text-xs font-semibold text-[var(--foreground)]">Import target</p>
+            <p className="mt-0.5 text-[0.6875rem] text-[var(--muted-foreground)]">
+              Import as a new card, or update one existing character while keeping its chat links.
+            </p>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label
+              className={`cursor-pointer rounded-lg border px-3 py-2 transition-colors ${
+                importMode === "new"
+                  ? "border-[var(--primary)] bg-[var(--primary)]/10"
+                  : "border-[var(--border)] bg-[var(--background)]/40 hover:border-[var(--muted-foreground)]"
+              }`}
+            >
+              <input
+                type="radio"
+                name="characterImportMode"
+                value="new"
+                checked={importMode === "new"}
+                onChange={() => setMode("new")}
+                className="sr-only"
+              />
+              <span className="block text-xs font-medium text-[var(--foreground)]">New copy</span>
+              <span className="mt-1 block text-[0.625rem] leading-snug text-[var(--muted-foreground)]">
+                Create separate imported characters.
+              </span>
+            </label>
+            <label
+              className={`cursor-pointer rounded-lg border px-3 py-2 transition-colors ${
+                importMode === "update"
+                  ? "border-[var(--primary)] bg-[var(--primary)]/10"
+                  : "border-[var(--border)] bg-[var(--background)]/40 hover:border-[var(--muted-foreground)]"
+              }`}
+            >
+              <input
+                type="radio"
+                name="characterImportMode"
+                value="update"
+                checked={importMode === "update"}
+                onChange={() => setMode("update")}
+                className="sr-only"
+              />
+              <span className="block text-xs font-medium text-[var(--foreground)]">Update existing</span>
+              <span className="mt-1 block text-[0.625rem] leading-snug text-[var(--muted-foreground)]">
+                Save the current card to version history first.
+              </span>
+            </label>
+          </div>
+          {importMode === "update" && (
+            <select
+              value={targetCharacterId}
+              onChange={(event) => setTargetCharacterId(event.target.value)}
+              className="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-xs text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
+            >
+              <option value="">
+                {characters.length > 0 ? "Choose character to update" : "No characters available"}
+              </option>
+              {characters
+                .filter((character) => typeof character.id === "string" && character.id)
+                .map((character) => (
+                  <option key={character.id} value={character.id}>
+                    {characterDisplayName(character)}
+                  </option>
+                ))}
+            </select>
+          )}
+        </div>
 
         <div className="rounded-xl border border-[var(--border)] bg-[var(--secondary)]/40 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
@@ -346,7 +518,9 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           <div className="text-center">
             <p className="text-sm font-medium">Drop one or more files here or click to browse</p>
             <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-              Supports JSON, PNG character cards, CharX, and Marinara exports
+              {importMode === "update"
+                ? "Choose one JSON, PNG character card, CharX, or Marinara character export"
+                : "Supports JSON, PNG character cards, CharX, and Marinara exports"}
             </p>
           </div>
           <div className="flex gap-2">
@@ -369,7 +543,7 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           ref={fileRef}
           type="file"
           accept=".json,.png,.marinara,.charx"
-          multiple
+          multiple={acceptsMultipleFiles}
           className="hidden"
           onChange={(e) => {
             handleFiles(Array.from(e.target.files ?? []));

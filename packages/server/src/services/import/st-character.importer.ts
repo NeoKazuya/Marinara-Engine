@@ -46,6 +46,7 @@ export interface STCharacterImportOptions {
   importEmbeddedLorebook?: boolean;
   tagImportMode?: STCharacterTagImportMode;
   existingTagKeys?: ReadonlySet<string>;
+  targetCharacterId?: string | null;
 }
 
 export type STCharacterTagImportMode = "all" | "none" | "existing";
@@ -55,6 +56,7 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
   const normalizedTimestamps = normalizeTimestampOverrides(options?.timestampOverrides);
   const shouldImportEmbeddedLorebook = options?.importEmbeddedLorebook ?? true;
   const tagImportMode = options?.tagImportMode ?? "all";
+  const targetCharacterId = options?.targetCharacterId?.trim() || null;
 
   // Extract avatar data URL if present (from PNG import)
   const avatarDataUrl = raw._avatarDataUrl as string | null;
@@ -105,6 +107,10 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
     },
   };
 
+  if (targetCharacterId && !(await storage.getById(targetCharacterId))) {
+    return { success: false, error: "Target character not found" };
+  }
+
   // Save avatar image if provided
   let avatarPath: string | undefined;
   if (avatarDataUrl && avatarDataUrl.startsWith("data:image/")) {
@@ -121,12 +127,21 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
     }
   }
 
-  const character = await storage.create(data, avatarPath, normalizedTimestamps);
+  const character = targetCharacterId
+    ? await storage.update(targetCharacterId, data, avatarPath, {
+        versionSource: "import",
+        versionReason: `Imported updated card from ${data.name || "character import"}`,
+        mergeExtensions: false,
+      })
+    : await storage.create(data, avatarPath, normalizedTimestamps);
   const charId = (character as { id?: string } | null)?.id;
+  if (targetCharacterId && !character) {
+    return { success: false, error: "Target character not found" };
+  }
 
   // Extract character_book into a standalone lorebook linked to this character
   let lorebookResult: { lorebookId?: string; entriesImported?: number } | null = null;
-  if (shouldImportEmbeddedLorebook && data.character_book && charId) {
+  if (!targetCharacterId && shouldImportEmbeddedLorebook && data.character_book && charId) {
     const bookRaw = rawEmbeddedLorebook as unknown as Record<string, unknown>;
     // ST character_book uses the same shape as World Info
     const wiData: Record<string, unknown> = {
@@ -181,12 +196,13 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
   return {
     success: true,
     characterId: charId,
+    updatedExisting: !!targetCharacterId,
     name: data.name,
     embeddedLorebook: {
       hasEmbeddedLorebook,
       entries: embeddedLorebookEntries,
       imported: !!lorebookResult,
-      skipped: hasEmbeddedLorebook && !shouldImportEmbeddedLorebook,
+      skipped: hasEmbeddedLorebook && (targetCharacterId ? true : !shouldImportEmbeddedLorebook),
     },
     ...(lorebookResult ? { lorebook: lorebookResult } : {}),
   };

@@ -178,17 +178,36 @@ function readFilterMode(value: unknown): LorebookFilterMode {
  * Import a Marinara `.marinara.json` export envelope.
  * Dispatches to the correct handler based on the `type` field.
  */
+export interface ImportMarinaraOptions {
+  targetCharacterId?: string | null;
+}
+
 export async function importMarinara(
   envelope: ExportEnvelope,
   db: DB,
-): Promise<{ success: boolean; type: ExportType; id?: string; name?: string; error?: string }> {
+  options?: ImportMarinaraOptions,
+): Promise<{
+  success: boolean;
+  type: ExportType;
+  id?: string;
+  name?: string;
+  error?: string;
+  updatedExisting?: boolean;
+}> {
   if (!envelope || typeof envelope !== "object" || !envelope.type || envelope.version !== 1) {
     return { success: false, type: "marinara_character" as ExportType, error: "Invalid Marinara export file" };
+  }
+  if (options?.targetCharacterId && envelope.type !== "marinara_character") {
+    return {
+      success: false,
+      type: envelope.type,
+      error: "Update existing character only supports Marinara character exports.",
+    };
   }
 
   switch (envelope.type) {
     case "marinara_character":
-      return importCharacter(envelope.data, db);
+      return importCharacter(envelope.data, db, options);
     case "marinara_persona":
       return importPersona(envelope.data, db);
     case "marinara_lorebook":
@@ -202,9 +221,10 @@ export async function importMarinara(
 
 // ── Character ────────────────────────────────
 
-async function importCharacter(data: unknown, db: DB) {
+async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOptions) {
   const storage = createCharactersStorage(db);
   const galleryStorage = createCharacterGalleryStorage(db);
+  const targetCharacterId = options?.targetCharacterId?.trim() || null;
   const d = data as {
     data?: Record<string, unknown>;
     spec?: string;
@@ -266,19 +286,38 @@ async function importCharacter(data: unknown, db: DB) {
     charData.extensions = extensions;
   }
 
-  const result = await storage.create(charData as any, undefined, readTimestampOverrides(d), comment);
+  const timestampOverrides = readTimestampOverrides(d);
+  const target = targetCharacterId ? await storage.getById(targetCharacterId) : null;
+  if (targetCharacterId && !target) {
+    return { success: false, type: "marinara_character" as const, error: "Target character not found" };
+  }
+
+  const targetAvatarPath = targetCharacterId
+    ? ((await saveAvatarFromDataUrl(d.avatar, "character", targetCharacterId)) ?? undefined)
+    : undefined;
+  const result = targetCharacterId
+    ? await storage.update(targetCharacterId, charData as any, targetAvatarPath, {
+        comment,
+        versionSource: "import",
+        versionReason: `Imported updated card from ${(charData as any).name || "Marinara export"}`,
+        mergeExtensions: false,
+      })
+    : await storage.create(charData as any, undefined, timestampOverrides, comment);
   if (result?.id) {
-    const avatarPath = await saveAvatarFromDataUrl(d.avatar, "character", result.id);
-    if (avatarPath) {
-      await storage.updateAvatar(result.id, avatarPath);
+    if (!targetCharacterId) {
+      const avatarPath = await saveAvatarFromDataUrl(d.avatar, "character", result.id);
+      if (avatarPath) {
+        await storage.updateAvatar(result.id, avatarPath);
+      }
+      await restoreSprites(d.sprites, result.id);
+      await restoreCharacterGallery(d.gallery, result.id, galleryStorage);
     }
-    await restoreSprites(d.sprites, result.id);
-    await restoreCharacterGallery(d.gallery, result.id, galleryStorage);
   }
   return {
     success: true,
     type: "marinara_character" as const,
     id: result?.id,
+    updatedExisting: !!targetCharacterId,
     name: (charData as any).name ?? "Imported character",
   };
 }

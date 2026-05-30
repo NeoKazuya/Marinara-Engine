@@ -315,6 +315,18 @@ function readMultipartTagImportMode(file: { fields?: Record<string, any> } | nul
   return readTagImportMode(rawValue);
 }
 
+function readTargetCharacterId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function readMultipartTargetCharacterId(file: { fields?: Record<string, any> } | null | undefined) {
+  const field = file?.fields?.targetCharacterId;
+  const rawValue = Array.isArray(field) ? field.at(-1)?.value : field?.value;
+  return readTargetCharacterId(rawValue);
+}
+
 function invalidTagImportModeResponse() {
   return {
     success: false,
@@ -351,6 +363,7 @@ async function importCharacterBuffer(
   importEmbeddedLorebook?: boolean,
   tagImportMode?: STCharacterTagImportMode,
   existingTagKeys?: ReadonlySet<string>,
+  targetCharacterId?: string,
 ) {
   if (fileName.toLowerCase().endsWith(".png")) {
     const charData = extractCharaFromPng(buffer);
@@ -368,16 +381,29 @@ async function importCharacterBuffer(
       importEmbeddedLorebook,
       tagImportMode,
       existingTagKeys,
+      targetCharacterId,
     });
   }
 
   if (fileName.toLowerCase().endsWith(".charx")) {
-    return importCharX(buffer, db, { timestampOverrides, importEmbeddedLorebook, tagImportMode, existingTagKeys });
+    return importCharX(buffer, db, {
+      timestampOverrides,
+      importEmbeddedLorebook,
+      tagImportMode,
+      existingTagKeys,
+      targetCharacterId,
+    });
   }
 
   try {
     const json = JSON.parse(buffer.toString("utf-8"));
-    return importSTCharacter(json, db, { timestampOverrides, importEmbeddedLorebook, tagImportMode, existingTagKeys });
+    return importSTCharacter(json, db, {
+      timestampOverrides,
+      importEmbeddedLorebook,
+      tagImportMode,
+      existingTagKeys,
+      targetCharacterId,
+    });
   } catch {
     return {
       success: false,
@@ -559,6 +585,7 @@ export async function importRoutes(app: FastifyInstance) {
   app.post("/marinara", async (req) => {
     const body = req.body as Record<string, unknown>;
     const timestampOverrides = readTimestampOverridesFromBody(body);
+    const targetCharacterId = readTargetCharacterId(body.targetCharacterId);
     const payload =
       timestampOverrides && body.data && typeof body.data === "object"
         ? {
@@ -575,7 +602,7 @@ export async function importRoutes(app: FastifyInstance) {
             },
           }
         : body;
-    return importMarinara(payload as any, app.db);
+    return importMarinara(payload as any, app.db, { targetCharacterId });
   });
 
   /**
@@ -647,7 +674,8 @@ export async function importRoutes(app: FastifyInstance) {
         data.metadata && typeof data.metadata === "object" ? (data.metadata as Record<string, unknown>) : {};
       data.metadata = { ...existingMeta, timestamps: timestampOverrides };
     }
-    return importMarinara(envelope as any, app.db);
+    const targetCharacterId = readMultipartTargetCharacterId(file as any);
+    return importMarinara(envelope as any, app.db, { targetCharacterId });
   });
 
   /** Import a SillyTavern character (JSON body or PNG file upload). */
@@ -665,6 +693,7 @@ export async function importRoutes(app: FastifyInstance) {
         ? rawTagImportModeField.at(-1)?.value
         : rawTagImportModeField?.value;
       const tagImportMode = readMultipartTagImportMode(file as any);
+      const targetCharacterId = readMultipartTargetCharacterId(file as any);
       if (rawTagImportMode !== undefined && tagImportMode === undefined) return invalidTagImportModeResponse();
       return importCharacterBuffer(
         file.filename ?? "",
@@ -673,6 +702,8 @@ export async function importRoutes(app: FastifyInstance) {
         timestampOverrides,
         importEmbeddedLorebook,
         tagImportMode,
+        undefined,
+        targetCharacterId,
       );
     }
 
@@ -681,13 +712,16 @@ export async function importRoutes(app: FastifyInstance) {
     const importEmbeddedLorebook = readBooleanOption(body.importEmbeddedLorebook);
     const rawTagImportMode = body.tagImportMode;
     const tagImportMode = readTagImportMode(rawTagImportMode);
+    const targetCharacterId = readTargetCharacterId(body.targetCharacterId);
     if (rawTagImportMode !== undefined && tagImportMode === undefined) return invalidTagImportModeResponse();
     delete body.importEmbeddedLorebook;
     delete body.tagImportMode;
+    delete body.targetCharacterId;
     return importSTCharacter(body, app.db, {
       timestampOverrides: readTimestampOverridesFromBody(body),
       importEmbeddedLorebook,
       tagImportMode,
+      targetCharacterId,
     });
   });
 
@@ -725,6 +759,7 @@ export async function importRoutes(app: FastifyInstance) {
     const timestampEntries: Array<{ name?: string; lastModified?: number | string }> = [];
     let importEmbeddedLorebook: boolean | undefined;
     let tagImportMode: STCharacterTagImportMode | undefined;
+    let targetCharacterId: string | undefined;
     let invalidTagImportMode = false;
 
     for await (const part of parts) {
@@ -755,12 +790,23 @@ export async function importRoutes(app: FastifyInstance) {
         tagImportMode = readTagImportMode(part.value);
         invalidTagImportMode ||= part.value !== undefined && tagImportMode === undefined;
       }
+
+      if (part.fieldname === "targetCharacterId") {
+        targetCharacterId = readTargetCharacterId(part.value);
+      }
     }
 
     if (invalidTagImportMode) return { ...invalidTagImportModeResponse(), results: [] };
 
     if (files.length === 0) {
       return { success: false, error: "No files uploaded", results: [] };
+    }
+    if (targetCharacterId && files.length !== 1) {
+      return {
+        success: false,
+        error: "Updating an existing character accepts exactly one character file.",
+        results: [],
+      };
     }
 
     const timestampsByName = new Map<string, Array<{ lastModified?: number | string }>>();
@@ -789,6 +835,7 @@ export async function importRoutes(app: FastifyInstance) {
           importEmbeddedLorebook,
           tagImportMode,
           existingTagKeys,
+          targetCharacterId,
         );
         results.push({ filename: file.filename, ...result });
       } catch (error) {

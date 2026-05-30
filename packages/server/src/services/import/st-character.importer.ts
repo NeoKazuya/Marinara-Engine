@@ -107,9 +107,11 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
     },
   };
 
-  if (targetCharacterId && !(await storage.getById(targetCharacterId))) {
+  const targetCharacter = targetCharacterId ? await storage.getById(targetCharacterId) : null;
+  if (targetCharacterId && !targetCharacter) {
     return { success: false, error: "Target character not found" };
   }
+  const existingLinkedLorebookId = getEmbeddedLorebookIdFromCharacterRow(targetCharacter);
 
   // Save avatar image if provided
   let avatarPath: string | undefined;
@@ -140,8 +142,8 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
   }
 
   // Extract character_book into a standalone lorebook linked to this character
-  let lorebookResult: { lorebookId?: string; entriesImported?: number } | null = null;
-  if (!targetCharacterId && shouldImportEmbeddedLorebook && data.character_book && charId) {
+  let lorebookResult: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean } | null = null;
+  if (shouldImportEmbeddedLorebook && data.character_book && charId) {
     const bookRaw = rawEmbeddedLorebook as unknown as Record<string, unknown>;
     // ST character_book uses the same shape as World Info
     const wiData: Record<string, unknown> = {
@@ -164,11 +166,13 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
         characterId: charId,
         namePrefix: data.name,
         timestampOverrides: options?.timestampOverrides,
+        existingLorebookId: targetCharacterId ? existingLinkedLorebookId : null,
       });
       if (result && "lorebookId" in result) {
         lorebookResult = {
           lorebookId: result.lorebookId as string,
           entriesImported: result.entriesImported as number,
+          updatedExisting: Boolean(result.reimported),
         };
 
         const updatedImportMetadata = {
@@ -202,7 +206,7 @@ export async function importSTCharacter(raw: Record<string, unknown>, db: DB, op
       hasEmbeddedLorebook,
       entries: embeddedLorebookEntries,
       imported: !!lorebookResult,
-      skipped: hasEmbeddedLorebook && (targetCharacterId ? true : !shouldImportEmbeddedLorebook),
+      skipped: hasEmbeddedLorebook && !lorebookResult && !shouldImportEmbeddedLorebook,
     },
     ...(lorebookResult ? { lorebook: lorebookResult } : {}),
   };
@@ -378,6 +382,38 @@ function buildCardSpecMetadata(raw: Record<string, unknown>) {
     ...(spec ? { spec } : {}),
     ...(specVersion ? { specVersion } : {}),
   };
+}
+
+function parseCharacterRowData(row: { data?: unknown } | null | undefined): Record<string, unknown> {
+  if (!row) return {};
+  try {
+    if (typeof row.data === "string") {
+      const parsed = JSON.parse(row.data);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    }
+    return row.data && typeof row.data === "object" && !Array.isArray(row.data)
+      ? (row.data as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function getEmbeddedLorebookIdFromCharacterRow(row: { data?: unknown } | null | undefined): string | null {
+  const data = parseCharacterRowData(row);
+  const extensions =
+    data.extensions && typeof data.extensions === "object" && !Array.isArray(data.extensions)
+      ? (data.extensions as Record<string, unknown>)
+      : {};
+  const importMetadata =
+    extensions[IMPORT_METADATA_KEY] && typeof extensions[IMPORT_METADATA_KEY] === "object"
+      ? (extensions[IMPORT_METADATA_KEY] as Record<string, unknown>)
+      : {};
+  const embeddedLorebook =
+    importMetadata.embeddedLorebook && typeof importMetadata.embeddedLorebook === "object"
+      ? (importMetadata.embeddedLorebook as Record<string, unknown>)
+      : {};
+  return typeof embeddedLorebook.lorebookId === "string" ? embeddedLorebook.lorebookId : null;
 }
 
 function tagKey(value: string) {

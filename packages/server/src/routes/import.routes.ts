@@ -20,6 +20,7 @@ import { importSTPreset } from "../services/import/st-prompt.importer.js";
 import { importSTLorebook } from "../services/import/st-lorebook.importer.js";
 import { importMarinara } from "../services/import/marinara.importer.js";
 import { scanSTFolder, runSTBulkImport, type STBulkImportOptions } from "../services/import/st-bulk.importer.js";
+import { buildCharacterNameTargetMap, resolveCharacterNameTarget } from "../services/import/character-name-match.js";
 import { characters as charactersTable } from "../db/schema/index.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { newId } from "../utils/id-generator.js";
@@ -327,6 +328,11 @@ function readMultipartTargetCharacterId(file: { fields?: Record<string, any> } |
   return readTargetCharacterId(rawValue);
 }
 
+function ambiguousCharacterNameError(name: unknown, count: number) {
+  const displayName = typeof name === "string" && name.trim() ? name.trim() : "this card";
+  return `Multiple existing characters match "${displayName}" (${count} matches). Choose a specific target character.`;
+}
+
 function invalidTagImportModeResponse() {
   return {
     success: false,
@@ -586,6 +592,8 @@ export async function importRoutes(app: FastifyInstance) {
     const body = req.body as Record<string, unknown>;
     const timestampOverrides = readTimestampOverridesFromBody(body);
     const targetCharacterId = readTargetCharacterId(body.targetCharacterId);
+    const matchExistingByName = readBooleanOption(body.matchExistingByName) === true;
+    const importEmbeddedLorebook = readBooleanOption(body.importEmbeddedLorebook);
     const payload =
       timestampOverrides && body.data && typeof body.data === "object"
         ? {
@@ -602,7 +610,11 @@ export async function importRoutes(app: FastifyInstance) {
             },
           }
         : body;
-    return importMarinara(payload as any, app.db, { targetCharacterId });
+    return importMarinara(payload as any, app.db, {
+      targetCharacterId,
+      matchExistingByName,
+      importEmbeddedLorebook,
+    });
   });
 
   /**
@@ -675,7 +687,13 @@ export async function importRoutes(app: FastifyInstance) {
       data.metadata = { ...existingMeta, timestamps: timestampOverrides };
     }
     const targetCharacterId = readMultipartTargetCharacterId(file as any);
-    return importMarinara(envelope as any, app.db, { targetCharacterId });
+    const matchExistingByName = readMultipartBooleanField(file as any, "matchExistingByName") === true;
+    const importEmbeddedLorebook = readMultipartBooleanField(file as any, "importEmbeddedLorebook");
+    return importMarinara(envelope as any, app.db, {
+      targetCharacterId,
+      matchExistingByName,
+      importEmbeddedLorebook,
+    });
   });
 
   /** Import a SillyTavern character (JSON body or PNG file upload). */
@@ -694,16 +712,32 @@ export async function importRoutes(app: FastifyInstance) {
         : rawTagImportModeField?.value;
       const tagImportMode = readMultipartTagImportMode(file as any);
       const targetCharacterId = readMultipartTargetCharacterId(file as any);
+      const matchExistingByName = readMultipartBooleanField(file as any, "matchExistingByName") === true;
       if (rawTagImportMode !== undefined && tagImportMode === undefined) return invalidTagImportModeResponse();
+      if (targetCharacterId && matchExistingByName) {
+        return { success: false, error: "Choose either auto-match or a specific target character, not both." };
+      }
+      const buffer = await file.toBuffer();
+      let resolvedTargetCharacterId = targetCharacterId;
+      if (matchExistingByName) {
+        const preview = await inspectCharacterBuffer(file.filename ?? "character", buffer);
+        if (!preview.success) return { success: false, error: preview.error ?? "Could not inspect character card." };
+        const targets = await buildCharacterNameTargetMap(app.db);
+        const match = resolveCharacterNameTarget(targets, preview.name);
+        if (match.kind === "ambiguous") {
+          return { success: false, error: ambiguousCharacterNameError(preview.name, match.targets.length) };
+        }
+        if (match.kind === "unique") resolvedTargetCharacterId = match.target.id;
+      }
       return importCharacterBuffer(
         file.filename ?? "",
-        await file.toBuffer(),
+        buffer,
         app.db,
         timestampOverrides,
         importEmbeddedLorebook,
         tagImportMode,
         undefined,
-        targetCharacterId,
+        resolvedTargetCharacterId,
       );
     }
 
@@ -713,15 +747,31 @@ export async function importRoutes(app: FastifyInstance) {
     const rawTagImportMode = body.tagImportMode;
     const tagImportMode = readTagImportMode(rawTagImportMode);
     const targetCharacterId = readTargetCharacterId(body.targetCharacterId);
+    const matchExistingByName = readBooleanOption(body.matchExistingByName) === true;
     if (rawTagImportMode !== undefined && tagImportMode === undefined) return invalidTagImportModeResponse();
+    if (targetCharacterId && matchExistingByName) {
+      return { success: false, error: "Choose either auto-match or a specific target character, not both." };
+    }
     delete body.importEmbeddedLorebook;
     delete body.tagImportMode;
     delete body.targetCharacterId;
+    delete body.matchExistingByName;
+    let resolvedTargetCharacterId = targetCharacterId;
+    if (matchExistingByName) {
+      const preview = inspectSTCharacter(body);
+      if (!preview.success) return { success: false, error: preview.error ?? "Could not inspect character card." };
+      const targets = await buildCharacterNameTargetMap(app.db);
+      const match = resolveCharacterNameTarget(targets, preview.name);
+      if (match.kind === "ambiguous") {
+        return { success: false, error: ambiguousCharacterNameError(preview.name, match.targets.length) };
+      }
+      if (match.kind === "unique") resolvedTargetCharacterId = match.target.id;
+    }
     return importSTCharacter(body, app.db, {
       timestampOverrides: readTimestampOverridesFromBody(body),
       importEmbeddedLorebook,
       tagImportMode,
-      targetCharacterId,
+      targetCharacterId: resolvedTargetCharacterId,
     });
   });
 
@@ -760,6 +810,7 @@ export async function importRoutes(app: FastifyInstance) {
     let importEmbeddedLorebook: boolean | undefined;
     let tagImportMode: STCharacterTagImportMode | undefined;
     let targetCharacterId: string | undefined;
+    let matchExistingByName = false;
     let invalidTagImportMode = false;
 
     for await (const part of parts) {
@@ -794,9 +845,20 @@ export async function importRoutes(app: FastifyInstance) {
       if (part.fieldname === "targetCharacterId") {
         targetCharacterId = readTargetCharacterId(part.value);
       }
+
+      if (part.fieldname === "matchExistingByName") {
+        matchExistingByName = readBooleanOption(part.value) === true;
+      }
     }
 
     if (invalidTagImportMode) return { ...invalidTagImportModeResponse(), results: [] };
+    if (targetCharacterId && matchExistingByName) {
+      return {
+        success: false,
+        error: "Choose either auto-match or a specific target character, not both.",
+        results: [],
+      };
+    }
 
     if (files.length === 0) {
       return { success: false, error: "No files uploaded", results: [] };
@@ -820,6 +882,7 @@ export async function importRoutes(app: FastifyInstance) {
     const results = [];
     const existingTagKeys =
       tagImportMode === "existing" && files.length > 0 ? await getExistingCharacterTagKeys(app.db) : undefined;
+    const targetsByName = matchExistingByName ? await buildCharacterNameTargetMap(app.db) : null;
     for (const file of files) {
       const timestampEntry = timestampsByName.get(file.filename)?.shift();
       const timestampOverrides = normalizeTimestampOverrides({
@@ -827,6 +890,30 @@ export async function importRoutes(app: FastifyInstance) {
         updatedAt: timestampEntry?.lastModified,
       });
       try {
+        let resolvedTargetCharacterId = targetCharacterId;
+        if (targetsByName) {
+          const preview = await inspectCharacterBuffer(file.filename, file.buffer);
+          if (!preview.success) {
+            results.push({
+              filename: file.filename,
+              success: false,
+              error: preview.error ?? "Could not inspect character card.",
+            });
+            continue;
+          }
+          const match = resolveCharacterNameTarget(targetsByName, preview.name);
+          if (match.kind === "ambiguous") {
+            results.push({
+              filename: file.filename,
+              success: false,
+              name: preview.name,
+              error: ambiguousCharacterNameError(preview.name, match.targets.length),
+            });
+            continue;
+          }
+          if (match.kind === "unique") resolvedTargetCharacterId = match.target.id;
+        }
+
         const result = await importCharacterBuffer(
           file.filename,
           file.buffer,
@@ -835,7 +922,7 @@ export async function importRoutes(app: FastifyInstance) {
           importEmbeddedLorebook,
           tagImportMode,
           existingTagKeys,
-          targetCharacterId,
+          resolvedTargetCharacterId,
         );
         results.push({ filename: file.filename, ...result });
       } catch (error) {

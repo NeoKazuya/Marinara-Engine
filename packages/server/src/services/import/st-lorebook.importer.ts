@@ -354,6 +354,7 @@ export async function importSTLorebook(
 
   let lorebook: Record<string, unknown> | null = null;
   const existingLorebookId = options?.existingLorebookId ?? null;
+  let reimported = false;
   if (existingLorebookId) {
     const existing = (await storage.getById(existingLorebookId)) as Record<string, unknown> | null;
     if (existing) {
@@ -362,6 +363,7 @@ export async function importSTLorebook(
       for (const entry of existingEntries) {
         await storage.removeEntry(entry.id);
       }
+      reimported = true;
     }
   }
 
@@ -439,6 +441,6 @@ export async function importSTLorebook(
     name: lorebookName,
     category: detectedCategory,
     entriesImported: imported,
-    reimported: !!existingLorebookId,
+    reimported,
   };
 }

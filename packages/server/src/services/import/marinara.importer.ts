@@ -8,7 +8,9 @@ import { createCharactersStorage } from "../storage/characters.storage.js";
 import { createCharacterGalleryStorage } from "../storage/character-gallery.storage.js";
 import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
 import { createPromptsStorage } from "../storage/prompts.storage.js";
+import { buildCharacterNameTargetMap, resolveCharacterNameTarget } from "./character-name-match.js";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "./import-timestamps.js";
+import { importSTLorebook } from "./st-lorebook.importer.js";
 import { mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { DATA_DIR } from "../../utils/data-dir.js";
@@ -174,12 +176,75 @@ function readFilterMode(value: unknown): LorebookFilterMode {
   return parsed.success ? parsed.data : "any";
 }
 
+function parseCharacterRowData(row: { data?: unknown } | null | undefined): Record<string, unknown> {
+  if (!row) return {};
+  try {
+    if (typeof row.data === "string") {
+      const parsed = JSON.parse(row.data);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    }
+    return row.data && typeof row.data === "object" && !Array.isArray(row.data)
+      ? (row.data as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function getEmbeddedLorebookIdFromCharacterRow(row: { data?: unknown } | null | undefined): string | null {
+  const data = parseCharacterRowData(row);
+  const extensions =
+    data.extensions && typeof data.extensions === "object" && !Array.isArray(data.extensions)
+      ? (data.extensions as Record<string, unknown>)
+      : {};
+  const importMetadata =
+    extensions.importMetadata && typeof extensions.importMetadata === "object"
+      ? (extensions.importMetadata as Record<string, unknown>)
+      : {};
+  const embeddedLorebook =
+    importMetadata.embeddedLorebook && typeof importMetadata.embeddedLorebook === "object"
+      ? (importMetadata.embeddedLorebook as Record<string, unknown>)
+      : {};
+  return typeof embeddedLorebook.lorebookId === "string" ? embeddedLorebook.lorebookId : null;
+}
+
+function writeEmbeddedLorebookMetadata(charData: Record<string, unknown>, lorebookId: string) {
+  const extensions =
+    charData.extensions && typeof charData.extensions === "object" && !Array.isArray(charData.extensions)
+      ? ({ ...(charData.extensions as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const importMetadata =
+    extensions.importMetadata && typeof extensions.importMetadata === "object"
+      ? ({ ...(extensions.importMetadata as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const embeddedLorebook =
+    importMetadata.embeddedLorebook && typeof importMetadata.embeddedLorebook === "object"
+      ? ({ ...(importMetadata.embeddedLorebook as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+
+  importMetadata.embeddedLorebook = {
+    ...embeddedLorebook,
+    hasEmbeddedLorebook: true,
+    lorebookId,
+  };
+  extensions.importMetadata = importMetadata;
+  charData.extensions = extensions;
+  return extensions;
+}
+
+function ambiguousCharacterNameError(name: unknown, count: number) {
+  const displayName = typeof name === "string" && name.trim() ? name.trim() : "this character";
+  return `Multiple existing characters match "${displayName}" (${count} matches). Choose a specific target character.`;
+}
+
 /**
  * Import a Marinara `.marinara.json` export envelope.
  * Dispatches to the correct handler based on the `type` field.
  */
 export interface ImportMarinaraOptions {
   targetCharacterId?: string | null;
+  matchExistingByName?: boolean;
+  importEmbeddedLorebook?: boolean;
 }
 
 export async function importMarinara(
@@ -193,15 +258,23 @@ export async function importMarinara(
   name?: string;
   error?: string;
   updatedExisting?: boolean;
+  lorebook?: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean };
 }> {
   if (!envelope || typeof envelope !== "object" || !envelope.type || envelope.version !== 1) {
     return { success: false, type: "marinara_character" as ExportType, error: "Invalid Marinara export file" };
   }
-  if (options?.targetCharacterId && envelope.type !== "marinara_character") {
+  if ((options?.targetCharacterId || options?.matchExistingByName) && envelope.type !== "marinara_character") {
     return {
       success: false,
       type: envelope.type,
       error: "Update existing character only supports Marinara character exports.",
+    };
+  }
+  if (options?.targetCharacterId && options?.matchExistingByName) {
+    return {
+      success: false,
+      type: envelope.type,
+      error: "Choose either auto-match or a specific target character, not both.",
     };
   }
 
@@ -224,7 +297,7 @@ export async function importMarinara(
 async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOptions) {
   const storage = createCharactersStorage(db);
   const galleryStorage = createCharacterGalleryStorage(db);
-  const targetCharacterId = options?.targetCharacterId?.trim() || null;
+  let targetCharacterId = options?.targetCharacterId?.trim() || null;
   const d = data as {
     data?: Record<string, unknown>;
     spec?: string;
@@ -287,10 +360,24 @@ async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOp
   }
 
   const timestampOverrides = readTimestampOverrides(d);
+  if (!targetCharacterId && options?.matchExistingByName) {
+    const targets = await buildCharacterNameTargetMap(db);
+    const match = resolveCharacterNameTarget(targets, (charData as Record<string, unknown>).name);
+    if (match.kind === "ambiguous") {
+      return {
+        success: false,
+        type: "marinara_character" as const,
+        error: ambiguousCharacterNameError((charData as Record<string, unknown>).name, match.targets.length),
+      };
+    }
+    if (match.kind === "unique") targetCharacterId = match.target.id;
+  }
+
   const target = targetCharacterId ? await storage.getById(targetCharacterId) : null;
   if (targetCharacterId && !target) {
     return { success: false, type: "marinara_character" as const, error: "Target character not found" };
   }
+  const existingLinkedLorebookId = getEmbeddedLorebookIdFromCharacterRow(target);
 
   const targetAvatarPath = targetCharacterId
     ? ((await saveAvatarFromDataUrl(d.avatar, "character", targetCharacterId)) ?? undefined)
@@ -303,6 +390,7 @@ async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOp
         mergeExtensions: false,
       })
     : await storage.create(charData as any, undefined, timestampOverrides, comment);
+  let lorebookResult: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean } | null = null;
   if (result?.id) {
     if (!targetCharacterId) {
       const avatarPath = await saveAvatarFromDataUrl(d.avatar, "character", result.id);
@@ -312,6 +400,30 @@ async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOp
       await restoreSprites(d.sprites, result.id);
       await restoreCharacterGallery(d.gallery, result.id, galleryStorage);
     }
+    if (
+      options?.importEmbeddedLorebook &&
+      charData.character_book &&
+      typeof charData.character_book === "object" &&
+      !Array.isArray(charData.character_book)
+    ) {
+      const importedLorebook = await importSTLorebook(charData.character_book as Record<string, unknown>, db, {
+        characterId: result.id,
+        namePrefix: String((charData as any).name || "Character"),
+        timestampOverrides,
+        existingLorebookId: targetCharacterId ? existingLinkedLorebookId : null,
+      });
+      if (importedLorebook && "lorebookId" in importedLorebook) {
+        lorebookResult = {
+          lorebookId: importedLorebook.lorebookId as string,
+          entriesImported: importedLorebook.entriesImported as number,
+          updatedExisting: Boolean(importedLorebook.reimported),
+        };
+        const updatedExtensions = writeEmbeddedLorebookMetadata(charData, importedLorebook.lorebookId as string);
+        await storage.update(result.id, { extensions: updatedExtensions as any }, undefined, {
+          skipVersionSnapshot: true,
+        });
+      }
+    }
   }
   return {
     success: true,
@@ -319,6 +431,7 @@ async function importCharacter(data: unknown, db: DB, options?: ImportMarinaraOp
     id: result?.id,
     updatedExisting: !!targetCharacterId,
     name: (charData as any).name ?? "Imported character",
+    ...(lorebookResult ? { lorebook: lorebookResult } : {}),
   };
 }
 

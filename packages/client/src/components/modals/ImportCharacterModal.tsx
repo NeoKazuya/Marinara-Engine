@@ -24,13 +24,26 @@ type ImportResultRow = {
   message: string;
 };
 
+type CharacterImportResponseRow = {
+  filename: string;
+  success: boolean;
+  name?: string;
+  error?: string;
+  updatedExisting?: boolean;
+  lorebook?: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean };
+  embeddedLorebook?: { hasEmbeddedLorebook?: boolean; skipped?: boolean; entries?: number };
+};
+
 type TagImportMode = "all" | "none" | "existing";
 type ImportMode = "new" | "update";
+type EmbeddedLorebookMode = "keep" | "sync";
 type CharacterRow = Record<string, unknown> & {
   id?: string;
   name?: string;
   data?: unknown;
 };
+
+const AUTO_MATCH_TARGET = "__auto_match__";
 
 const TAG_IMPORT_OPTIONS: Array<{ value: TagImportMode; label: string; description: string }> = [
   { value: "all", label: "All tags", description: "Keep source tags." },
@@ -59,6 +72,18 @@ function characterDisplayName(character: CharacterRow | undefined) {
   return readString(character?.name) || readString(data.name) || "Unnamed character";
 }
 
+function embeddedLorebookSuffix(result: CharacterImportResponseRow) {
+  if (result.lorebook?.lorebookId) {
+    return result.lorebook.updatedExisting
+      ? " and updated its standalone lorebook"
+      : " and linked a standalone lorebook";
+  }
+  if (result.embeddedLorebook?.skipped) {
+    return " with embedded lorebook kept inside the card";
+  }
+  return "";
+}
+
 export function ImportCharacterModal({ open, onClose }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
   const { data: rawCharacters } = useCharacters(open);
@@ -71,18 +96,22 @@ export function ImportCharacterModal({ open, onClose }: Props) {
   } | null>(null);
   const [tagImportMode, setTagImportMode] = useState<TagImportMode>("all");
   const [importMode, setImportMode] = useState<ImportMode>("new");
-  const [targetCharacterId, setTargetCharacterId] = useState("");
+  const [targetCharacterId, setTargetCharacterId] = useState(AUTO_MATCH_TARGET);
+  const [embeddedLorebookMode, setEmbeddedLorebookMode] = useState<EmbeddedLorebookMode>("keep");
   const qc = useQueryClient();
   const characters = (Array.isArray(rawCharacters) ? rawCharacters : []) as CharacterRow[];
-  const targetCharacterName = characterDisplayName(characters.find((character) => character.id === targetCharacterId));
-  const acceptsMultipleFiles = importMode === "new";
+  const isAutoMatchUpdate = importMode === "update" && targetCharacterId === AUTO_MATCH_TARGET;
+  const targetCharacterName = isAutoMatchUpdate
+    ? "Auto-match by name"
+    : characterDisplayName(characters.find((character) => character.id === targetCharacterId));
+  const acceptsMultipleFiles = importMode === "new" || isAutoMatchUpdate;
 
   const setMode = (mode: ImportMode) => {
     setImportMode(mode);
     setPendingLorebookChoice(null);
     setResults([]);
     setStatus("idle");
-    if (mode === "new") setTargetCharacterId("");
+    setTargetCharacterId(mode === "update" ? AUTO_MATCH_TARGET : "");
   };
 
   const isZipFile = async (file: File): Promise<boolean> => {
@@ -93,7 +122,10 @@ export function ImportCharacterModal({ open, onClose }: Props) {
 
   const handleFiles = async (files: File[], importEmbeddedLorebook?: boolean) => {
     if (files.length === 0) return;
-    if (importMode === "update" && !targetCharacterId) {
+    const updateSpecificTarget = importMode === "update" && !isAutoMatchUpdate;
+    const syncEmbeddedLorebook = importMode === "update" && embeddedLorebookMode === "sync";
+
+    if (updateSpecificTarget && !targetCharacterId) {
       setResults([
         {
           filename: files.length === 1 ? files[0]!.name : `${files.length} files`,
@@ -104,12 +136,12 @@ export function ImportCharacterModal({ open, onClose }: Props) {
       setStatus("done");
       return;
     }
-    if (importMode === "update" && files.length !== 1) {
+    if (updateSpecificTarget && files.length !== 1) {
       setResults([
         {
           filename: `${files.length} files`,
           success: false,
-          message: "Update existing accepts one character file at a time.",
+          message: "A specific target accepts one character file at a time.",
         },
       ]);
       setStatus("done");
@@ -189,23 +221,20 @@ export function ImportCharacterModal({ open, onClose }: Props) {
         );
         form.append(
           "importEmbeddedLorebook",
-          String(importMode === "update" ? false : (importEmbeddedLorebook ?? true)),
+          String(importMode === "update" ? syncEmbeddedLorebook : (importEmbeddedLorebook ?? true)),
         );
         form.append("tagImportMode", tagImportMode);
         if (importMode === "update") {
-          form.append("targetCharacterId", targetCharacterId);
+          if (isAutoMatchUpdate) {
+            form.append("matchExistingByName", "true");
+          } else {
+            form.append("targetCharacterId", targetCharacterId);
+          }
         }
 
         const batchResult = await api.upload<{
           success: boolean;
-          results: Array<{
-            filename: string;
-            success: boolean;
-            name?: string;
-            error?: string;
-            lorebook?: { lorebookId?: string };
-            embeddedLorebook?: { hasEmbeddedLorebook?: boolean; skipped?: boolean; entries?: number };
-          }>;
+          results: CharacterImportResponseRow[];
         }>("/import/st-character/batch", form);
 
         for (const result of batchResult.results) {
@@ -215,7 +244,11 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             success: result.success,
             message:
               result.success && importMode === "update"
-                ? `Updated "${targetCharacterName}" from "${result.name ?? result.filename}"`
+                ? result.updatedExisting
+                  ? isAutoMatchUpdate
+                    ? `Updated "${result.name ?? result.filename}"${embeddedLorebookSuffix(result)}`
+                    : `Updated "${targetCharacterName}" from "${result.name ?? result.filename}"${embeddedLorebookSuffix(result)}`
+                  : `Imported new "${result.name ?? result.filename}" (no existing name match)${embeddedLorebookSuffix(result)}`
                 : result.success
                   ? `Imported "${result.name ?? result.filename}"${
                       result.embeddedLorebook?.skipped
@@ -235,21 +268,43 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             success: boolean;
             name?: string;
             error?: string;
+            updatedExisting?: boolean;
+            lorebook?: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean };
           }>("/import/marinara", {
             ...item.payload,
-            ...(importMode === "update" ? { targetCharacterId } : {}),
+            ...(importMode === "update"
+              ? isAutoMatchUpdate
+                ? { matchExistingByName: true, importEmbeddedLorebook: syncEmbeddedLorebook }
+                : { targetCharacterId, importEmbeddedLorebook: syncEmbeddedLorebook }
+              : {}),
             timestampOverrides: {
               createdAt: item.file.lastModified,
               updatedAt: item.file.lastModified,
             },
           });
+          if (result.lorebook?.lorebookId) importedLorebook = true;
 
           nextResults.push({
             filename: item.file.name,
             success: result.success,
             message:
               result.success && importMode === "update"
-                ? `Updated "${targetCharacterName}" from "${result.name ?? item.file.name}"`
+                ? result.updatedExisting
+                  ? isAutoMatchUpdate
+                    ? `Updated "${result.name ?? item.file.name}"${embeddedLorebookSuffix({
+                        ...result,
+                        filename: item.file.name,
+                      })}`
+                    : `Updated "${targetCharacterName}" from "${result.name ?? item.file.name}"${embeddedLorebookSuffix(
+                        {
+                          ...result,
+                          filename: item.file.name,
+                        },
+                      )}`
+                  : `Imported new "${result.name ?? item.file.name}" (no existing name match)${embeddedLorebookSuffix({
+                      ...result,
+                      filename: item.file.name,
+                    })}`
                 : result.success
                   ? `Imported "${result.name ?? item.file.name}"`
                   : (result.error ?? "Import failed"),
@@ -272,18 +327,37 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             JSON.stringify({ createdAt: file.lastModified, updatedAt: file.lastModified }),
           );
           if (importMode === "update") {
-            form.append("targetCharacterId", targetCharacterId);
+            form.append("importEmbeddedLorebook", String(syncEmbeddedLorebook));
+            if (isAutoMatchUpdate) {
+              form.append("matchExistingByName", "true");
+            } else {
+              form.append("targetCharacterId", targetCharacterId);
+            }
           }
-          const result = await api.upload<{ success: boolean; name?: string; error?: string }>(
-            "/import/marinara-package",
-            form,
-          );
+          const result = await api.upload<{
+            success: boolean;
+            name?: string;
+            error?: string;
+            updatedExisting?: boolean;
+            lorebook?: { lorebookId?: string; entriesImported?: number; updatedExisting?: boolean };
+          }>("/import/marinara-package", form);
+          if (result.lorebook?.lorebookId) importedLorebook = true;
           nextResults.push({
             filename: file.name,
             success: result.success,
             message:
               result.success && importMode === "update"
-                ? `Updated "${targetCharacterName}" from "${result.name ?? file.name}"`
+                ? result.updatedExisting
+                  ? isAutoMatchUpdate
+                    ? `Updated "${result.name ?? file.name}"${embeddedLorebookSuffix({ ...result, filename: file.name })}`
+                    : `Updated "${targetCharacterName}" from "${result.name ?? file.name}"${embeddedLorebookSuffix({
+                        ...result,
+                        filename: file.name,
+                      })}`
+                  : `Imported new "${result.name ?? file.name}" (no existing name match)${embeddedLorebookSuffix({
+                      ...result,
+                      filename: file.name,
+                    })}`
                 : result.success
                   ? `Imported "${result.name ?? file.name}"`
                   : (result.error ?? "Import failed"),
@@ -301,8 +375,10 @@ export function ImportCharacterModal({ open, onClose }: Props) {
       setStatus("done");
 
       if (nextResults.some((result) => result.success)) {
-        qc.invalidateQueries({ queryKey: characterKeys.list() });
-        if (importMode === "update") {
+        qc.invalidateQueries({
+          queryKey: importMode === "update" && isAutoMatchUpdate ? characterKeys.all : characterKeys.list(),
+        });
+        if (importMode === "update" && !isAutoMatchUpdate) {
           qc.invalidateQueries({ queryKey: characterKeys.detail(targetCharacterId) });
           qc.invalidateQueries({ queryKey: characterKeys.versions(targetCharacterId) });
         }
@@ -334,7 +410,8 @@ export function ImportCharacterModal({ open, onClose }: Props) {
     setPendingLorebookChoice(null);
     setTagImportMode("all");
     setImportMode("new");
-    setTargetCharacterId("");
+    setTargetCharacterId(AUTO_MATCH_TARGET);
+    setEmbeddedLorebookMode("keep");
   };
 
   return (
@@ -395,7 +472,7 @@ export function ImportCharacterModal({ open, onClose }: Props) {
           <div className="mb-2">
             <p className="text-xs font-semibold text-[var(--foreground)]">Import target</p>
             <p className="mt-0.5 text-[0.6875rem] text-[var(--muted-foreground)]">
-              Import as a new card, or update one existing character while keeping its chat links.
+              Import as new cards, or update matching existing characters while keeping chat links.
             </p>
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
@@ -436,27 +513,72 @@ export function ImportCharacterModal({ open, onClose }: Props) {
               />
               <span className="block text-xs font-medium text-[var(--foreground)]">Update existing</span>
               <span className="mt-1 block text-[0.625rem] leading-snug text-[var(--muted-foreground)]">
-                Save the current card to version history first.
+                Auto-match by name, or pick one target.
               </span>
             </label>
           </div>
           {importMode === "update" && (
-            <select
-              value={targetCharacterId}
-              onChange={(event) => setTargetCharacterId(event.target.value)}
-              className="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-xs text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
-            >
-              <option value="">
-                {characters.length > 0 ? "Choose character to update" : "No characters available"}
-              </option>
-              {characters
-                .filter((character) => typeof character.id === "string" && character.id)
-                .map((character) => (
-                  <option key={character.id} value={character.id}>
-                    {characterDisplayName(character)}
-                  </option>
-                ))}
-            </select>
+            <>
+              <select
+                value={targetCharacterId}
+                onChange={(event) => setTargetCharacterId(event.target.value)}
+                className="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-xs text-[var(--foreground)] outline-none focus:border-[var(--primary)]"
+              >
+                <option value={AUTO_MATCH_TARGET}>Auto-match by name</option>
+                {characters
+                  .filter((character) => typeof character.id === "string" && character.id)
+                  .map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {characterDisplayName(character)}
+                    </option>
+                  ))}
+              </select>
+              <div className="mt-3 border-t border-[var(--border)] pt-3">
+                <p className="text-xs font-semibold text-[var(--foreground)]">Embedded lorebook</p>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <label
+                    className={`cursor-pointer rounded-lg border px-3 py-2 transition-colors ${
+                      embeddedLorebookMode === "keep"
+                        ? "border-[var(--primary)] bg-[var(--primary)]/10"
+                        : "border-[var(--border)] bg-[var(--background)]/40 hover:border-[var(--muted-foreground)]"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="embeddedLorebookMode"
+                      value="keep"
+                      checked={embeddedLorebookMode === "keep"}
+                      onChange={() => setEmbeddedLorebookMode("keep")}
+                      className="sr-only"
+                    />
+                    <span className="block text-xs font-medium text-[var(--foreground)]">Keep in card</span>
+                    <span className="mt-1 block text-[0.625rem] leading-snug text-[var(--muted-foreground)]">
+                      Do not change standalone lorebooks.
+                    </span>
+                  </label>
+                  <label
+                    className={`cursor-pointer rounded-lg border px-3 py-2 transition-colors ${
+                      embeddedLorebookMode === "sync"
+                        ? "border-[var(--primary)] bg-[var(--primary)]/10"
+                        : "border-[var(--border)] bg-[var(--background)]/40 hover:border-[var(--muted-foreground)]"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="embeddedLorebookMode"
+                      value="sync"
+                      checked={embeddedLorebookMode === "sync"}
+                      onChange={() => setEmbeddedLorebookMode("sync")}
+                      className="sr-only"
+                    />
+                    <span className="block text-xs font-medium text-[var(--foreground)]">Sync standalone</span>
+                    <span className="mt-1 block text-[0.625rem] leading-snug text-[var(--muted-foreground)]">
+                      Update or create the linked lorebook.
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </>
           )}
         </div>
 
@@ -519,7 +641,9 @@ export function ImportCharacterModal({ open, onClose }: Props) {
             <p className="text-sm font-medium">Drop one or more files here or click to browse</p>
             <p className="mt-1 text-xs text-[var(--muted-foreground)]">
               {importMode === "update"
-                ? "Choose one JSON, PNG character card, CharX, or Marinara character export"
+                ? isAutoMatchUpdate
+                  ? "Drop one or more cards; matching names update existing characters"
+                  : "Choose one JSON, PNG character card, CharX, or Marinara character export"
                 : "Supports JSON, PNG character cards, CharX, and Marinara exports"}
             </p>
           </div>
